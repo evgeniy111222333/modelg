@@ -165,20 +165,24 @@ _GLOCK_AABB = np.array([[-4.5, -5.45, -0.90],
                          [ 4.2,  2.02,  1.00]], dtype=np.float32)  # min / max
 
 def _aabb_hit(ro, rd):
-    """Returns bool mask of rays that intersect Glock AABB."""
+    """Returns (mask, t_entry) for rays that intersect Glock AABB."""
     bmin, bmax = _GLOCK_AABB[0], _GLOCK_AABB[1]
     inv_d = np.where(np.abs(rd) > 1e-7, 1.0 / rd, np.sign(rd) * 1e7).astype(np.float32)
     t0 = (bmin - ro) * inv_d
     t1 = (bmax - ro) * inv_d
-    tmin = np.maximum(np.minimum(t0, t1).max(axis=-1), np.float32(0.0))
+    tmin = np.maximum(np.minimum(t0, t1).max(axis=-1), np.float32(0.04))
     tmax = np.minimum(np.maximum(t0, t1).min(axis=-1), np.float32(25.0))
-    return tmin <= tmax
+    mask = tmin <= tmax
+    return mask, tmin
 
 
 def _march_rays(sdf_fn, ray_o, ray_d, max_steps=72, t_min=0.05,
-                t_max=22.0, tol=0.0014):
+                t_max=22.0, tol=0.0014, t_start=None):
     N    = ray_o.shape[0]
-    t    = np.full(N, t_min, dtype=np.float32)
+    if t_start is not None:
+        t = np.maximum(t_start.astype(np.float32), np.float32(t_min))
+    else:
+        t = np.full(N, t_min, dtype=np.float32)
     hit  = np.zeros(N, dtype=bool)
     ro32 = ray_o.astype(np.float32)
     rd32 = ray_d.astype(np.float32)
@@ -316,14 +320,17 @@ def render_frame(sdf_model, cam_pos, cam_target, W=800, H=800,
     # ── Single-batch render (fast path) ───────────────────────────────
     def _render_batch(ro, rd):
         # Fast AABB pretest — skip rays that can't possibly hit the model
-        maybe = _aabb_hit(ro, rd)
+        maybe, t_entry = _aabb_hit(ro, rd)
         if not maybe.any():
             return None, np.zeros(len(ro), dtype=bool)
 
         t_full = np.full(len(ro), 30.0, dtype=np.float32)
         hit_full = np.zeros(len(ro), dtype=bool)
 
-        t_sub, hit_sub = _march_rays(sdf_batch, ro[maybe], rd[maybe], max_steps=72, tol=0.0014)
+        # Start march at AABB entry t to skip empty space between camera and model
+        t_sub, hit_sub = _march_rays(sdf_batch, ro[maybe], rd[maybe],
+                                     max_steps=72, tol=0.0014,
+                                     t_start=t_entry[maybe])
         t_full[maybe] = t_sub
         hit_full[maybe] = hit_sub
 

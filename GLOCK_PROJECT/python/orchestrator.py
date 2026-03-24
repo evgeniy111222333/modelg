@@ -106,7 +106,7 @@ def _perturb_normal_stipple(n, p, metal_t):
 # ──────────────────────────────────────────────────────────────────────
 #  AMBIENT OCCLUSION
 # ──────────────────────────────────────────────────────────────────────
-def _calc_ao(sdf_fn, p, n, steps=6, max_dist=0.70):
+def _calc_ao(sdf_fn, p, n, steps=4, max_dist=0.65):
     occ   = np.zeros(p.shape[0], dtype=np.float32)
     scale = np.float32(1.0)
     p32   = p.astype(np.float32)
@@ -123,7 +123,7 @@ def _calc_ao(sdf_fn, p, n, steps=6, max_dist=0.70):
 # ──────────────────────────────────────────────────────────────────────
 #  SOFT SHADOWS
 # ──────────────────────────────────────────────────────────────────────
-def _soft_shadow(sdf_fn, ro, rd, t_min=0.06, t_max=5.5, k=12.0, steps=16):
+def _soft_shadow(sdf_fn, ro, rd, t_min=0.06, t_max=5.5, k=12.0, steps=10):
     N  = ro.shape[0]
     sh = np.ones(N,  dtype=np.float32)
     t  = np.full(N,  t_min, dtype=np.float32)
@@ -159,10 +159,24 @@ def _sdf_normal(sdf_fn, p, eps=0.0026):
     return _normalize(n.astype(np.float32))
 
 # ──────────────────────────────────────────────────────────────────────
-#  RAY MARCHER
+#  BOUNDING BOX PRETEST (AABB slab method — skips ~40% of rays cheaply)
 # ──────────────────────────────────────────────────────────────────────
-def _march_rays(sdf_fn, ray_o, ray_d, max_steps=96, t_min=0.05,
-                t_max=28.0, tol=0.0010):
+_GLOCK_AABB = np.array([[-4.5, -5.45, -0.90],
+                         [ 4.2,  2.02,  1.00]], dtype=np.float32)  # min / max
+
+def _aabb_hit(ro, rd):
+    """Returns bool mask of rays that intersect Glock AABB."""
+    bmin, bmax = _GLOCK_AABB[0], _GLOCK_AABB[1]
+    inv_d = np.where(np.abs(rd) > 1e-7, 1.0 / rd, np.sign(rd) * 1e7).astype(np.float32)
+    t0 = (bmin - ro) * inv_d
+    t1 = (bmax - ro) * inv_d
+    tmin = np.maximum(np.minimum(t0, t1).max(axis=-1), np.float32(0.0))
+    tmax = np.minimum(np.maximum(t0, t1).min(axis=-1), np.float32(25.0))
+    return tmin <= tmax
+
+
+def _march_rays(sdf_fn, ray_o, ray_d, max_steps=72, t_min=0.05,
+                t_max=22.0, tol=0.0014):
     N    = ray_o.shape[0]
     t    = np.full(N, t_min, dtype=np.float32)
     hit  = np.zeros(N, dtype=bool)
@@ -173,7 +187,7 @@ def _march_rays(sdf_fn, ray_o, ray_d, max_steps=96, t_min=0.05,
         if not alive.any(): break
         p = ro32[alive] + rd32[alive] * t[alive, np.newaxis]
         d = sdf_fn(p).astype(np.float32)
-        t[alive]  += np.maximum(d, 3e-4)
+        t[alive]  += np.maximum(d, 6e-4)
         hit[alive] |= (d < tol)
     return t, hit
 
@@ -291,7 +305,7 @@ def render_frame(sdf_model, cam_pos, cam_target, W=800, H=800,
     ray_d = _normalize(directions.reshape(N, 3)).astype(np.float32)
     ray_o = np.broadcast_to(cam_pos_np, (N, 3)).copy().astype(np.float32)
 
-    _fast = sdf_model.make_evaluator()
+    _fast = sdf_model.make_c_evaluator()
     def sdf_batch(p): return _fast(p[:,0], p[:,1], p[:,2])
 
     bg_top = np.array([0.055,0.072,0.108], dtype=np.float32)
@@ -301,7 +315,19 @@ def render_frame(sdf_model, cam_pos, cam_target, W=800, H=800,
 
     # ── Single-batch render (fast path) ───────────────────────────────
     def _render_batch(ro, rd):
-        t, hit = _march_rays(sdf_batch, ro, rd, max_steps=110, tol=0.0009)
+        # Fast AABB pretest — skip rays that can't possibly hit the model
+        maybe = _aabb_hit(ro, rd)
+        if not maybe.any():
+            return None, np.zeros(len(ro), dtype=bool)
+
+        t_full = np.full(len(ro), 30.0, dtype=np.float32)
+        hit_full = np.zeros(len(ro), dtype=bool)
+
+        t_sub, hit_sub = _march_rays(sdf_batch, ro[maybe], rd[maybe], max_steps=72, tol=0.0014)
+        t_full[maybe] = t_sub
+        hit_full[maybe] = hit_sub
+
+        t, hit = t_full, hit_full
         if not hit.any():
             return None, hit
         p_hit  = (ro[hit] + rd[hit]*t[hit, np.newaxis]).astype(np.float32)

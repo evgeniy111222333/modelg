@@ -574,6 +574,150 @@ def _glock_make_evaluator(self):
 GlockSDF.make_evaluator = _glock_make_evaluator
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+#  C / OpenMP COMPILER  — ~80× faster than numpy flat eval
+#  Compiles the flat numpy source to C via gcc, loads with ctypes.
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _numpy_to_c_src(py_src):
+    """Convert flat numpy eval source to a C shared-library source string."""
+    import re
+
+    def split_top_commas(s):
+        parts=[]; d=0; cur=[]
+        for c in s:
+            if c=='(': d+=1
+            elif c==')': d-=1
+            if c==',' and d==0: parts.append(''.join(cur).strip()); cur=[]
+            else: cur.append(c)
+        if cur: parts.append(''.join(cur).strip())
+        return parts
+
+    def replace_calls(s):
+        result=[]; i=0
+        while i<len(s):
+            m=re.match(r'np\.(sqrt|abs|maximum|minimum|clip)\(', s[i:])
+            if m:
+                fname=m.group(1); start=i+m.end(); depth=1; j=start
+                while j<len(s) and depth>0:
+                    if s[j]=='(': depth+=1
+                    elif s[j]==')': depth-=1
+                    j+=1
+                inner=replace_calls(s[start:j-1])
+                if fname=='sqrt':   result.append(f'sqrtf({inner})')
+                elif fname=='abs':  result.append(f'fabsf({inner})')
+                elif fname in ('maximum','minimum'):
+                    fn='fmaxf' if fname=='maximum' else 'fminf'
+                    result.append(f'{fn}({inner})')
+                elif fname=='clip':
+                    p=split_top_commas(inner)
+                    if len(p)==3: result.append(f'fmaxf({p[1]},fminf({p[2]},{p[0]}))')
+                    else: result.append(f'fmaxf({inner})')
+                i=j
+            else:
+                result.append(s[i]); i+=1
+        return ''.join(result)
+
+    def fix_pow2(s):
+        while '**2' in s:
+            idx=s.index('**2'); j=idx-1
+            if j>=0 and s[j]==')':
+                depth=1; j-=1
+                while j>=0 and depth>0:
+                    if s[j]==')': depth+=1
+                    elif s[j]=='(': depth-=1
+                    j-=1
+                j+=1
+                while j>0 and (s[j-1].isalpha() or s[j-1]=='.' or s[j-1]=='_'): j-=1
+            else:
+                while j>0 and (s[j-1].isalnum() or s[j-1] in '_.'): j-=1
+            expr=s[j:idx]
+            s=s[:j]+f'({expr})*({expr})'+s[idx+3:]
+        return s
+
+    def add_f(s):
+        return re.sub(r'(?<![.\w])(\d+\.\d*)(?!f)(?!\d)', r'\1f', s)
+
+    lines_in=py_src.strip().split('\n')
+    out=['#include <math.h>',
+         'static inline float sdf_eval(float x,float y,float z){']
+    for line in lines_in[1:-1]:
+        s=line.strip()
+        if not s: continue
+        s=fix_pow2(s); s=replace_calls(s); s=add_f(s)
+        s=re.sub(r',\s*0\b\s*\)', ',0.0f)', s)
+        s=re.sub(r'--', '+', s)
+        s=re.sub(r'\b0\.f\b', '0.0f', s)
+        m=re.match(r'^(_\w+)\s*=\s*(.+)$',s)
+        if m: out.append(f'  float {m.group(1)}={m.group(2)};')
+        else: out.append('  '+s+';')
+    ret_var=re.search(r'return\s+(\S+?)(?:\.astype|$)', lines_in[-1]).group(1)
+    out+=[f'  return {ret_var};', '}', '',
+          'void eval_batch(const float*x,const float*y,const float*z,float*out,int n){',
+          '  #pragma omp parallel for schedule(static)',
+          '  for(int i=0;i<n;i++) out[i]=sdf_eval(x[i],y[i],z[i]);',
+          '}']
+    return '\n'.join(out)
+
+
+def _glock_make_c_evaluator(self):
+    """Compile SDF to C+OpenMP shared library via gcc; return callable.
+
+    Falls back to numpy flat evaluator if gcc is unavailable.
+    """
+    if hasattr(self, '_c_eval'):
+        return self._c_eval
+
+    import ctypes, subprocess, tempfile, os, time as _t, shutil
+    if not shutil.which('gcc'):
+        print('  [SDF-C] gcc not found, falling back to numpy evaluator')
+        return self.make_evaluator()
+
+    _, py_src = compile_flat(self.root)
+    c_src = _numpy_to_c_src(py_src)
+
+    tmpdir = tempfile.mkdtemp(prefix='sdf_c_')
+    c_path  = os.path.join(tmpdir, 'sdf.c')
+    so_path = os.path.join(tmpdir, 'sdf.so')
+    with open(c_path, 'w') as f: f.write(c_src)
+
+    t0 = _t.perf_counter()
+    ret = subprocess.run(
+        ['gcc', '-O3', '-march=native', '-ffast-math', '-fopenmp',
+         '-shared', '-fPIC', '-o', so_path, c_path, '-lm'],
+        capture_output=True)
+    if ret.returncode != 0:
+        print('  [SDF-C] gcc failed:', ret.stderr.decode()[:200])
+        print('  [SDF-C] falling back to numpy evaluator')
+        return self.make_evaluator()
+
+    lib = ctypes.CDLL(so_path)
+    lib.eval_batch.argtypes = [
+        ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_float),
+        ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_float),
+        ctypes.c_int]
+    lib.eval_batch.restype = None
+
+    _cfp = ctypes.POINTER(ctypes.c_float)
+    def _c_eval_fn(x, y, z):
+        n   = len(x)
+        xf  = np.ascontiguousarray(x, np.float32)
+        yf  = np.ascontiguousarray(y, np.float32)
+        zf  = np.ascontiguousarray(z, np.float32)
+        out = np.empty(n, np.float32)
+        lib.eval_batch(xf.ctypes.data_as(_cfp), yf.ctypes.data_as(_cfp),
+                       zf.ctypes.data_as(_cfp), out.ctypes.data_as(_cfp),
+                       ctypes.c_int(n))
+        return out
+
+    dt = (_t.perf_counter()-t0)*1e3
+    print(f'  [SDF-C] compiled in {dt:.0f}ms → {so_path}')
+    self._c_eval = _c_eval_fn
+    return _c_eval_fn
+
+GlockSDF.make_c_evaluator = _glock_make_c_evaluator
+
+
 if __name__ == '__main__':
     import time
     t0 = time.perf_counter()

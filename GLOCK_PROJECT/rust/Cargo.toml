@@ -1,0 +1,16 @@
+[package]
+name = "glock_render"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+wgpu = "0.19.1"
+pollster = "0.3.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tobj = "4.0.0"
+log = "0.4.20"
+env_logger = "0.11.2"
+cgmath = "0.18.0"
+bytemuck = { version = "1.14", features =["derive"] }
+image = "0.24"
